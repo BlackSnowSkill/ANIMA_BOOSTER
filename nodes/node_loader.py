@@ -24,6 +24,48 @@ from ..core.compile_utils import detect_and_compile_blocks
 logger = logging.getLogger("ANIMA_BOOSTER.loader")
 
 
+def patch_anima_extra_conds(model):
+    model_obj = model.model
+    if model_obj is not None and hasattr(model_obj, "diffusion_model"):
+        dm = model_obj.diffusion_model
+        if hasattr(dm, "preprocess_text_embeds"):
+            if hasattr(model_obj.extra_conds, "__patched_by_bss__"):
+                return
+            
+            import types
+            import comfy.conds
+            
+            cls = model_obj.__class__
+            
+            def patched_extra_conds(self_model, **kwargs):
+                out = super(cls, self_model).extra_conds(**kwargs)
+                cross_attn = kwargs.get("cross_attn", None)
+                t5xxl_ids = kwargs.get("t5xxl_ids", None)
+                t5xxl_weights = kwargs.get("t5xxl_weights", None)
+                device = kwargs["device"]
+                if cross_attn is not None:
+                    if t5xxl_ids is not None:
+                        if t5xxl_weights is not None:
+                            t5xxl_weights = t5xxl_weights.unsqueeze(0).unsqueeze(-1).to(cross_attn)
+                        t5xxl_ids = t5xxl_ids.unsqueeze(0)
+                        
+                        # Always preprocess text embeds to avoid dimension mismatch (1024 vs 2048) in KSampler
+                        cross_attn = self_model.diffusion_model.preprocess_text_embeds(
+                            cross_attn.to(device=device, dtype=self_model.get_dtype_inference()),
+                            t5xxl_ids.to(device=device),
+                            t5xxl_weights=t5xxl_weights.to(device=device, dtype=self_model.get_dtype_inference())
+                        )
+                    out['c_crossattn'] = comfy.conds.CONDRegular(cross_attn)
+                    # Remove raw t5xxl keys if they were added to avoid duplicate evaluation or cat shape errors
+                    out.pop('t5xxl_ids', None)
+                    out.pop('t5xxl_weights', None)
+                return out
+                
+            patched_extra_conds.__patched_by_bss__ = True
+            model_obj.extra_conds = types.MethodType(patched_extra_conds, model_obj)
+            logger.info("[ANIMA_BOOSTER] Successfully patched extra_conds for Anima model to force preprocess.")
+
+
 class AnimaBoosterLoader:
     """
     Optimized loader for Anima DiT models.
@@ -84,6 +126,9 @@ class AnimaBoosterLoader:
 
         # Load via ComfyUI's official function (identical to UNETLoader with default dtype)
         model = comfy.sd.load_diffusion_model(model_path, model_options={})
+
+        # Patch extra_conds if it is Anima model to prevent dimension mismatch crashes
+        patch_anima_extra_conds(model)
 
         dm = model.get_model_object("diffusion_model")
         logger.info(
@@ -177,6 +222,9 @@ class AnimaBoosterCheckpointLoader:
             embedding_directory=folder_paths.get_folder_paths("embeddings")
         )
         model, clip, vae, clipvision = out
+
+        # Patch extra_conds if it is Anima model to prevent dimension mismatch crashes
+        patch_anima_extra_conds(model)
 
         dm = model.get_model_object("diffusion_model")
         logger.info(
